@@ -118,6 +118,11 @@ User Input  ──────────────────────�
 | **System prompt** | `SYSTEM_PROMPT` | Sets persona, rules, and output format before any user message |
 | **Structured output** | Response tables | Agent formats ingredient lists as markdown tables |
 | `HumanMessage` | `agent.py`, `demo.ipynb` | Typed message wrapper for user input |
+| `ChefState(AgentState)` | `agent.py` | Custom LangGraph state — adds `user_ingredients` field tracked per thread |
+| `remember_ingredients` | `agent.py` | Tool that writes user-stated ingredients into state via `Command.update` |
+| `recall_ingredients` | `agent.py` | Tool that reads `user_ingredients` from state via `ToolRuntime` |
+| `Command(update={...})` | `remember_ingredients` | LangGraph primitive for writing to state from inside a tool |
+| `ToolRuntime` | `recall_ingredients` | Gives a tool read access to the live LangGraph state dict |
 
 ---
 
@@ -209,7 +214,9 @@ jupyter lab
 
 ## How Memory Works
 
-This is the thing that makes this more than a one-shot query.
+### 1. Conversation memory (messages)
+
+`InMemorySaver` (a LangGraph checkpointer) snapshots the full agent **state** after each `invoke()` call. On the next call with the same `thread_id`, the state is restored — so the agent has the full message history in its context window.
 
 ```python
 # Thread ID is the key — everything with the same ID shares memory
@@ -222,8 +229,6 @@ agent.invoke({"messages": [HumanMessage("I have chicken and rice")]}, config)
 agent.invoke({"messages": [HumanMessage("What was that first recipe?")]}, config)
 ```
 
-Under the hood, `InMemorySaver` (a LangGraph checkpointer) snapshots the full agent **state** (all messages + metadata) after each `invoke()` call. On the next call with the same `thread_id`, the state is restored — so the agent has the full history in its context window.
-
 ```
 Turn 1                    Turn 2                    Turn 3
 ┌──────────────┐          ┌────────────────────┐    ┌──────────────────────┐
@@ -233,6 +238,41 @@ Turn 1                    Turn 2                    Turn 3
   InMemorySaver           └────────────────────┘    └──────────────────────┘
   snapshots state           state grows each turn      full history replayed
 ```
+
+### 2. Ingredient memory (custom state field)
+
+A `ChefState` class extends `AgentState` with a dedicated `user_ingredients` field. This field holds **only what the user explicitly said** — it is never populated from recipe suggestions.
+
+```python
+class ChefState(AgentState):
+    user_ingredients: str  # e.g. "leftover chicken and rice"
+```
+
+When the user mentions their ingredients, the agent calls `remember_ingredients`, which uses LangGraph's `Command` to write to that field:
+
+```python
+@tool
+def remember_ingredients(ingredients: str, runtime: ToolRuntime) -> Command:
+    """Save the ingredients the user said they have to the conversation state."""
+    return Command(update={
+        "user_ingredients": ingredients,   # ← written into ChefState
+        "messages": [ToolMessage("Saved your ingredients: ...", ...)],
+    })
+```
+
+When the user asks *"what did I say I had?"*, the agent calls `recall_ingredients`, which reads directly from the state — not from the conversation text:
+
+```python
+@tool
+def recall_ingredients(runtime: ToolRuntime) -> str:
+    """Read the ingredients the user said they have from the conversation state."""
+    return runtime.state.get("user_ingredients", "")
+    # → "leftover chicken and rice"  (never "eggs" or "soy sauce")
+```
+
+**Why this prevents the confusion:** without this field, the model reads all messages and may accidentally include recipe-suggested ingredients (eggs, soy sauce, garlic…) in its answer. With the dedicated field, the answer is always sourced from the exact string the user typed.
+
+> **Memory scope:** Both mechanisms use `InMemorySaver`, which stores state in RAM. Memory lasts for the duration of the current Python process and is scoped to the `thread_id`. Restarting the process clears it. For persistence across restarts, replace `InMemorySaver` with a database-backed checkpointer such as `langgraph-checkpoint-sqlite`.
 
 ---
 
